@@ -3,4 +3,9 @@
 /SmolLM2-360M-Instruct-v1-model
 /unsloth_compiled_cache
 /Unsloth-SmolLM2-1.7B
+/Unsloth-SmolLM2-360M
+/Unsloth-SmolLM2-360M-Lora
+/Unsloth-SmolLM2-360M-v2
+/Unsloth-SmolLM2-1.7B-BKU
+*.csv
 .env
