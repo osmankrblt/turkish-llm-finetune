@@ -9,6 +9,7 @@
 /Unsloth-SmolLM2-1.7B-BKU
 /Unsloth-SmolLM2-1.7B-BKU-GPT
 /Unsloth-SmolLM2-1.7B-BKU-GPT-v2
+/Unsloth-Mistral-7B-v0.3-BKU-GPT
 *.csv
 *.xlsx
 .env
