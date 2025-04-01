@@ -3,9 +3,9 @@ import torch.nn as nn
 
 class TokenEmbedding(nn.Module):
 
-    def __init__(self, token_count=1000, embed_size=64):
+    def __init__(self, token_count=1000, embed_size=64, dtype=torch.bfloat16, device="cuda"):
         super().__init__()
-        self.embedding_layer = torch.nn.Embedding(token_count, embed_size)  # Embedding layer with len(tokenizer) unique words and embeds
+        self.embedding_layer = torch.nn.Embedding(token_count, embed_size, device=device, dtype=dtype)  # Embedding layer with len(tokenizer) unique words and embeds
 
     def forward(self,x):
 
@@ -15,9 +15,9 @@ class TokenEmbedding(nn.Module):
 
 class PositionEmbedding(nn.Module):
 
-    def __init__(self, max_seq_len=512*4,  embed_size=64):
+    def __init__(self, max_seq_len=512*4,  embed_size=64, dtype=torch.bfloat16, device="cuda"):
         super().__init__()
-        self.position_embedding = torch.nn.Embedding(max_seq_len, embed_size)  # Embedding layer with len(tokenizer) unique words and embeds
+        self.position_embedding = torch.nn.Embedding(max_seq_len, embed_size, device=device, dtype=dtype)  # Embedding layer with len(tokenizer) unique words and embeds
 
     def forward(self,x):
 
@@ -28,7 +28,7 @@ class PositionEmbedding(nn.Module):
 
 class EmbeddingLayer(nn.Module):
 
-    def __init__(self, token_count=1000,  max_seq_len=512*4, embed_size=64):
+    def __init__(self, token_count=1000,  max_seq_len=512*4, embed_size=64, dtype=torch.bfloat16, device="cuda"):
         super().__init__()
         self.token_embedding = TokenEmbedding(token_count, embed_size)  # Embedding layer with len(tokenizer) unique words and embeds
 
@@ -46,6 +46,6 @@ if __name__=="__main__":
 
     embedLayer = EmbeddingLayer(1000,64)
 
-    torchTensor = torch.tensor([[15,20,54]],  dtype=torch.long)
+    torchTensor = torch.tensor([[15,20,54]], device="cuda", dtype=torch.long)
     
     print(embedLayer.forward(torchTensor))
