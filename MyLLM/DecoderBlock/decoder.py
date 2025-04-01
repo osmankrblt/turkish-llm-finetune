@@ -5,12 +5,38 @@ from flash_attn import flash_attn_func
 
 class AttentionBlock(nn.Module):
 
-    def __init__(self, use_flash_attention2 = True):
+    def __init__(self, embed_size=64, n_heads=16, dropout=0.2, use_flash_attention2 = True):
         super().__init__()
 
-        if use_flash_attention2:
+        self.n_heads = n_heads
+        self.head_dim = embed_size // n_heads
+        self.qkv_proj = nn.Linear(embed_size, 3 * embed_size)
+        self.o_proj = nn.Linear(embed_size, embed_size)
+        self.ln = nn.LayerNorm(embed_size)
 
-            self.attention = flash_attn_func.FlashAttention(dim=64, num_heads=8, dropout=0.1)
+        self.dropout=dropout
+        self.embed_size = embed_size
+        self.use_flash_attention2 = use_flash_attention2
+        
+
+            
+
+    def forward(self, x):
+
+        B, T, C = x.size()
+        x = self.ln(x)
+        
+        qkv = self.qkv_proj(x)  # (B, T, 3 * C)
+        qkv = qkv.view(B, T, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]  # (B, T, n_heads, head_dim)
+        if self.use_flash_attention2:
+            out = flash_attn_func(q, k, v, causal=True)
+        else:
+            out = nn.MultiheadAttention(embed_dim=self.embed_size, num_heads=self.n_heads, batch_first=True, dropout=self.dropout)
+
+        out = out.view(B, T, C)
+
+        return self.o_proj(out)
 
 
 class LayerNorm(nn.Module):
@@ -51,7 +77,9 @@ class DecoderBlock(nn.Module):
         self.feedforward_network = FeedforwardNetwork()
         self.layer_norm = LayerNorm()
 
-    def forward(self, x, encoder_output):
+    def forward(self, x, attn_mask=None):
+        # LayerNorm → Attention → Residual
+        residual = x
 
         x = self.layer_norm(x)
 
@@ -66,4 +94,4 @@ class DecoderBlock(nn.Module):
 
 if __name__ == "__main__":
 
-    flash_attn_func.FlashAttention(dim=64, num_heads=8, dropout=0.1)
+    decoder_block = DecoderBlock()
