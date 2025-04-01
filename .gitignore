@@ -14,6 +14,10 @@
 /Unsloth-Llama-3B-v3.2-BKU-GPT
 /SmolLM2-1.7B-bnb-4bit-R32-Bias-DO
 /SmolLM2-1.7B-R32-Bias-DO
+/Func Calling/unsloth_compiled_cache
+/SmolLM2-1.7B-R32-Bias-DO-Emoji
+_*/
 *.csv
+*.txt
 *.xlsx
 .env
