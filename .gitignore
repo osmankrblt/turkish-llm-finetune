@@ -16,6 +16,9 @@
 /SmolLM2-1.7B-R32-Bias-DO
 /Func Calling/unsloth_compiled_cache
 /SmolLM2-1.7B-R32-Bias-DO-Emoji
+/Crispy-160M-V1
+/MyLLM/CrispyLLM
+/MyLLM/CrispyTokenizer
 _*/
 *.csv
 *.txt
