@@ -19,6 +19,7 @@
 /Crispy-160M-V1
 /MyLLM/CrispyLLM
 /MyLLM/CrispyTokenizer
+/MyLLM/CrispyLLM_RoPE
 /Crispy-330M-V1
 _*/
 *.csv
