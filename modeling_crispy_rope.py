@@ -10,14 +10,36 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import PreTrainedModel, GenerationMixin
 from transformers import AutoConfig
 
+
+class SwiGLU(nn.Module):
+    def __init__(self, dim_in, dim_out, device="cuda", dtype="bfloat16"):
+        super().__init__()
+        self.device = device
+        self.dtype = getattr(torch, dtype)
+
+        self.linear1 = nn.Linear(dim_in, dim_out * 2, device=self.device, dtype=self.dtype)
+        self.linear2 = nn.Linear(dim_out, dim_in, device=self.device, dtype=self.dtype)
+
+    def forward(self, x):
+        x = x.to(self.device).to(self.dtype)
+
+        x_proj = self.linear1(x)                       # (B, T, 2*dim_out)
+        x_gated, x_val = x_proj.chunk(2, dim=-1)       # İkiye ayır
+        x_swiglu = F.silu(x_gated) * x_val             # SwiGLU aktivasyonu
+
+        return self.linear2(x_swiglu) 
+
+
 class FlashAttentionBlockBase(nn.Module):
     def __init__(self, dropout=0.1):
         super().__init__()
         self.dropout= dropout
 
-    def forward(self, q, k, v, causal=True):
+    def forward(self, q, k, v,cu_seqlens=None, max_seqlen=None, causal=True):
         return flash_attn_func(q, k, v, causal=causal, dropout_p=self.dropout)
 
+
+""" 
 class FlashAttentionBlockMHA(nn.Module):
     def __init__(self, hidden_size=768, num_heads=12, dropout=0.1, device="cuda", dtype="bfloat16"):
         super().__init__()
@@ -38,6 +60,8 @@ class FlashAttentionBlockMHA(nn.Module):
     def forward(self, x, cu_seqlens=None, max_seqlen=None):
         return self.attn(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
+ """
+
 class AttentionBlock(nn.Module):
 
     def __init__(self, hidden_size=64, n_heads=16, dropout=0.1, max_seq_len=9048, device="cuda", dtype="bfloat16", **kwargs):
@@ -53,17 +77,51 @@ class AttentionBlock(nn.Module):
         self.head_dim = self.hidden_size // n_heads
         self.qkv_proj = nn.Linear(hidden_size, 3 * hidden_size, device=self.device, dtype=self.dtype)
         self.o_proj = nn.Linear(hidden_size, hidden_size, device=self.device, dtype=self.dtype)
-        self.ln = nn.LayerNorm(hidden_size, device=self.device, dtype=self.dtype)
+        self.rms_norm1 = RMSNormBlock(hidden_size, device=self.device, dtype=dtype)
 
       
-        self.attn = FlashAttentionBlockMHA(hidden_size=hidden_size , num_heads=self.n_heads, dropout=dropout) if self.config.attn_implementation == "flash_attention_2" else  nn.MultiheadAttention(embed_dim=hidden_size, num_heads=self.n_heads, batch_first=True, dropout=dropout, device=self.device, dtype=self.dtype)
+        self.attn = FlashAttentionBlockBase(dropout=dropout) if self.config.attn_implementation == "flash_attention_2" else  nn.MultiheadAttention(embed_dim=hidden_size, num_heads=self.n_heads, batch_first=True, dropout=dropout, device=self.device, dtype=self.dtype)
         
+        self.rope = RotaryPositionalEmbedding(device=self.device, dtype=dtype)
+
+  
+
+    def build_rope_cache(self,  base=10000):
+        """
+        RoPE için cos ve sin tablolarını oluşturur.
+        
+        Args:
+            seq_len (int): Maksimum sequence uzunluğu
+            dim (int): Attention dim (head_dim)
+            device (str): GPU/CPU
+            base (int): Rotary encoding için baz (default: 10_000)
+
+        Returns:
+            cos: [1, 1, seq_len, dim]
+            sin: [1, 1, seq_len, dim]
+        """
+
+        half_dim = self.head_dim // 2
+        inv_freq = 1.0 / (base ** (torch.arange(0, half_dim, 1.0, device=self.device) / half_dim))
+        # [seq_len, half_dim]
+        positions = torch.arange(self.max_seq_len, device=self.device).type_as(inv_freq).unsqueeze(1)  # [seq_len, 1]
+        freqs = torch.einsum("i,j->ij", positions.squeeze(), inv_freq)  # [seq_len, half_dim]
+
+        # [seq_len, dim]
+        emb = torch.cat([freqs, freqs], dim=-1)  # çiftlenmiş hali
+        cos = emb.cos()[None, None, :, :]  # [1, 1, seq_len, dim]
+        sin = emb.sin()[None, None, :, :]  # [1, 1, seq_len, dim]
+
+        return cos, sin
+  
+
         
         
     def forward(self, x, attention_mask=None, past_key_value=None, use_cache=False):
 
         B, T, C = x.size()
-        x = self.ln(x)
+        print(B,T,C)
+        x = self.rms_norm1(x)
 
         qkv = self.qkv_proj(x)  # (B, T, 3 * C)
         qkv = qkv.reshape(B, T, 3, self.n_heads, self.head_dim)  # (B, T, 3, H, D)
@@ -78,17 +136,25 @@ class AttentionBlock(nn.Module):
             v = qkv[:, :, 2]
 
         q = qkv[:, :, 0]
+        
+        
+        cos, sin = self.build_rope_cache()
 
+        position_ids = torch.arange(0, T, device=self.device).unsqueeze(0).expand(B, -1)  # [2, 2048]
+
+        # ve forward'da:
+        q, k = self.rope.forward(q, k, cos, sin, position_ids)
+       
         if self.config.attn_implementation == "flash_attention_2":
 
             total_tokens = attention_mask.sum(dim=1)  # her örnekteki gerçek token sayıları, shape: (B,)
-            cu_seqlens = F.pad(total_tokens.cumsum(0), (1, 0), value=0).to(torch.int32)  # shape: (B+1,)
+            cu_seqlens = F.pad(total_tokens.cumsum(0), (1, 0), value=0)  # shape: (B+1,)
             max_seqlen = total_tokens.max().item()  # batch içindeki en uzun dizi
             
             # x'i "packed" formata getir: (total, hidden_dim)
             x_flat = x.reshape(B * T, C).contiguous()
-            
-            out = self.attn(x_flat, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+          
+            out = self.attn(q,k,v, cu_seqlens=cu_seqlens.to(torch.int32), max_seqlen=max_seqlen)
 
         else:
             q = q.reshape(B, T, self.n_heads * self.head_dim)  # [1, 5, 768]
@@ -127,6 +193,21 @@ class LayerNorm(nn.Module):
     def forward(self, x ):
 
         return self.ln(x)
+    
+
+class RMSNormBlock(nn.Module):
+
+    def __init__(self, normalized_shape=64, eps = 1e-05, elementwise_affine=True, bias=True, device="cuda", dtype="bfloat16"):
+        super().__init__()
+
+        self.device = device
+        self.dtype = getattr(torch, dtype)
+
+        self.rmsNorm = nn.RMSNorm(normalized_shape, eps=eps, elementwise_affine=elementwise_affine,  device=self.device, dtype=self.dtype)
+
+    def forward(self, x ):
+
+        return self.rmsNorm(x)
 
 class FeedforwardNetwork(nn.Module):
 
@@ -137,13 +218,13 @@ class FeedforwardNetwork(nn.Module):
         self.dtype = getattr(torch, dtype)
 
         self.ln1 = nn.Linear(hidden_size, 4 * hidden_size, device=self.device, dtype=self.dtype)
-        self.gelu = nn.GELU()
+        self.swiglu = SwiGLU(4 * hidden_size, hidden_size, dtype=dtype, device=self.device)
         self.ln2 = nn.Linear(4 * hidden_size, hidden_size, device=self.device,dtype=self.dtype)
 
     def forward(self, x):
         
         x = self.ln1(x)
-        x = self.gelu(x)
+        x = self.swiglu(x)
         x = self.ln2(x)
         return x
 
@@ -160,25 +241,25 @@ class DecoderBlock(nn.Module):
 
         self.attention_block = AttentionBlock(config=self.config,hidden_size=hidden_size,n_heads=n_heads, max_seq_len=max_seq_len, device=device)
         self.feedforward_network = FeedforwardNetwork(hidden_size=hidden_size, device=device)
-        self.layer_norm1 = LayerNorm(normalized_shape=hidden_size, device=device, dtype=dtype)
-        self.layer_norm2 = LayerNorm(normalized_shape=hidden_size, device=device, dtype=dtype)
+        self.rms_norm1 = RMSNormBlock(normalized_shape=hidden_size, device=device, dtype=dtype)
+        self.rms_norm2 = RMSNormBlock(normalized_shape=hidden_size, device=device, dtype=dtype)
 
         self.dropout = nn.Dropout(0.2)
 
     def forward(self, x, attention_mask=None,past_key_value=None, use_cache=None):
-        # LayerNorm → Attention → Residual
+        # RMSNorm → Attention → Residual
         residual = x
 
-        x = self.layer_norm1(x)
+        x = self.rms_norm1(x)
 
         attention_out, new_past = self.attention_block(x, attention_mask, past_key_value=past_key_value,
         use_cache=use_cache)
 
         x = residual + self.dropout(attention_out)
 
-        # LayerNorm → Feedforward → Residual
+        # RMSNorm → Feedforward → Residual
         residual = x
-        x = self.layer_norm2(x)
+        x = self.rms_norm2(x)
 
         x = residual + self.dropout(self.feedforward_network(x))
 
@@ -204,7 +285,7 @@ class TokenEmbedding(nn.Module):
 
         return x
 
-class PositionEmbedding(nn.Module):
+""" class PositionEmbedding(nn.Module):
 
     def __init__(self, max_seq_len=512*4,  hidden_size=64, dtype="bfloat16", device="cuda"):
         super().__init__()
@@ -217,7 +298,61 @@ class PositionEmbedding(nn.Module):
 
         x = self.position_embedding(x)
 
-        return x
+        return x """
+    
+import torch
+import torch.nn as nn
+
+import torch
+import torch.nn as nn
+
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, device="cuda", dtype="bfloat16"):
+        super().__init__()
+        self.device = device
+        self.dtype = getattr(torch, dtype)
+
+    def _rotate_half(self, tensor):
+        """
+        Tensor'un son boyutunu ikiye bölerek yarısını rotasyon uygular:
+        [x1, x2] → [-x2, x1]
+        """
+        first_half = tensor[..., :tensor.shape[-1] // 2]
+        second_half = tensor[..., tensor.shape[-1] // 2:]
+        return torch.cat((-second_half, first_half), dim=-1)
+
+    def forward(self, q, k, cos, sin, position_ids):
+        """
+        Rotary Positional Embedding uygular.
+
+        Args:
+            q: Query tensor [batch, seq_len, heads, dim]
+            k: Key tensor   [batch, seq_len, heads, dim]
+            cos: [1, 1, seq_len, dim] formatında önceden hesaplanmış cos değerleri
+            sin: [1, 1, seq_len, dim] formatında önceden hesaplanmış sin değerleri
+            position_ids: [batch, seq_len] pozisyon index tensorü
+
+        Returns:
+            Tuple: (q_rotated, k_rotated)
+        """
+        # [seq_len, dim]
+        cos = cos.squeeze(0).squeeze(0).to(self.device).to(self.dtype)
+        sin = sin.squeeze(0).squeeze(0).to(self.device).to(self.dtype)
+
+        # [batch, seq_len, dim]
+        cos = cos[position_ids].unsqueeze(2).to(self.device).to(self.dtype)  # [B, T, 1, D]
+        sin = sin[position_ids].unsqueeze(2).to(self.device).to(self.dtype)
+
+        # q, k zaten [B, T, H, D] formatında olacak
+        q = q.to(self.device).to(self.dtype)
+        k = k.to(self.device).to(self.dtype)
+
+        q_rotated = (q * cos) + (self._rotate_half(q) * sin)
+        k_rotated = (k * cos) + (self._rotate_half(k) * sin)
+
+        return q_rotated, k_rotated
+
+
 
 
 class EmbeddingLayer(nn.Module):
@@ -230,11 +365,14 @@ class EmbeddingLayer(nn.Module):
 
         self.token_embedding = TokenEmbedding(token_count, hidden_size, dtype=self.dtype, device=self.device)  # Embedding layer with len(tokenizer) unique words and embeds
 
-        self.position_embedding = PositionEmbedding(max_seq_len, hidden_size, dtype=self.dtype, device=self.device)
+        #self.position_embedding = PositionEmbedding(max_seq_len, hidden_size, dtype=self.dtype, device=self.device)
 
     def forward(self,x):
-        positions = torch.arange(0, x.size(1), device=x.device).unsqueeze(0)
-        x = self.token_embedding(x) + self.position_embedding(positions)
+        #positions = torch.arange(0, x.size(1), device=x.device).unsqueeze(0)
+        
+        #x = self.token_embedding(x) + self.position_embedding(positions)
+        
+        x = self.token_embedding(x) 
 
         return x
     
@@ -274,7 +412,7 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
         self.embedding = EmbeddingLayer( token_count=config.vocab_size, max_seq_len = config.max_seq_len, hidden_size = config.hidden_size, device=config.device, dtype=config.dtype )
         self.decoderBlocks = nn.ModuleList([ (DecoderBlock(config=config,n_heads=config.n_heads,hidden_size= config.hidden_size, max_seq_len=config.max_seq_len,  device=config.device, dtype=config.dtype)) for i in range(config.num_hidden_layers)])
         
-        self.final_ln = LayerNorm(normalized_shape=config.hidden_size, device=config.device, dtype=config.dtype)
+        self.final_ln = RMSNormBlock(normalized_shape=config.hidden_size, device=config.device, dtype=config.dtype)
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, device=config.device, dtype=getattr(torch, config.dtype))
 
@@ -427,12 +565,12 @@ if __name__ == '__main__':
     from transformers import PreTrainedTokenizerFast
 
     tokenizer = PreTrainedTokenizerFast.from_pretrained("MyLLM/CrispyTokenizer")
-    crispy_config = CrispyLLMConfig(attn_implementation="flash_attention_2", vocab_size=len(tokenizer.get_vocab()),n_heads=8, max_seq_len=2048*4, hidden_size=64*16, num_hidden_layers=8, dtype="bfloat16", device="cuda")
+    crispy_config = CrispyLLMConfig(attn_implementation="flash_attention_2", vocab_size=len(tokenizer.get_vocab()), n_heads=8, max_seq_len=1024, hidden_size=64*16, num_hidden_layers=8, dtype="bfloat16", device="cuda")
 
     #crispy_config._attn_implementation_autoset = True  # 👈 Buraya ekliyorsun
     model = CrispyForCausalLM(crispy_config)
 
-    inputs = tokenizer("Selam nasılsın", max_length=8192, padding="max_length",return_tensors="pt")
+    inputs = tokenizer("Selam nasılsın", max_length=1024, padding="max_length",return_tensors="pt")
 
     inputs = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
