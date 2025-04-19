@@ -23,6 +23,7 @@
 /Crispy-330M-V1
 /Crispy-330M-V1-Rope-NewTokenizer-JustLanguage
 /MyLLM/CrispyLLM_RoPE2
+/Crispy-330M-V2-Rope-NewTokenizer-JustLanguage
 _*/
 *.csv
 *.txt
