@@ -689,8 +689,13 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
 
 
             labels = labels.clone()
-            labels[labels == self.config.pad_token_id] = -100
-            loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), labels.view(-1))
+
+            # SHIFT: logits ve labels kaydırılıyor
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            
+            #labels[labels == self.config.pad_token_id] = -100
+            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
 
         return CausalLMOutputWithPast(
             loss=loss,
