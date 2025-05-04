@@ -14,7 +14,7 @@ from safetensors.torch import load_file as safe_load_file
 import os
 import torch.nn as nn
 import torch.nn.init as init
-
+import glob
 
 class SwiGLU(nn.Module):
     def __init__(self, dim_in, dim_out, device="cuda", dtype="bfloat16"):
@@ -146,7 +146,7 @@ class AttentionBlock(nn.Module):
         #cos, sin = self.build_rope_cache()
 
         position_ids = torch.arange(0, T, device=self.device).unsqueeze(0).expand(B, -1)  # [2, 2048]
-
+        position_ids = position_ids.to(self.device)
         # ve forward'da:
         q, k = self.rope.forward(q, k, position_ids)
 
@@ -182,8 +182,8 @@ class AttentionBlock(nn.Module):
             seq_len = k.size(1)
 
             causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device)).to(torch.bool)
-
-            out, _ =  self.attn( q, k, v, attn_mask=causal_mask, key_padding_mask=attention_mask.bool(), need_weights=False)
+            key_padding_mask = attention_mask.bool() if attention_mask is not None else None
+            out, _ =  self.attn( q, k, v, attn_mask=causal_mask, key_padding_mask=key_padding_mask, need_weights=False)
 
         out = out.reshape(B, T, C)
 
@@ -260,7 +260,7 @@ class DecoderBlock(nn.Module):
         self.rms_norm1 = RMSNormBlock(normalized_shape=hidden_size, device=device, dtype=dtype)
         self.rms_norm2 = RMSNormBlock(normalized_shape=hidden_size, device=device, dtype=dtype)
 
-        self.dropout = nn.Dropout(0.2)
+        self.dropout = nn.Dropout(self.config.decoder_dropout)
 
     def forward(self, x, attention_mask=None, past_key_value=None, use_cache=None):
         # RMSNorm → Attention → Residual
@@ -331,14 +331,17 @@ class RotaryPositionalEmbedding(nn.Module):
         self.dtype = getattr(torch, dtype)
         self.config = config
 
-        self.head_dim = config.hidden_size // config.n_heads
+        self.head_dim = self.config.hidden_size // self.config.n_heads
         self.base = 10000
-        self.scaling_factor = config.rope_scaling["factor"] if config.rope_scaling else 1.0
+        self.scaling_factor = self.config.rope_scaling["factor"] if self.config.rope_scaling else 1.0
 
         # Başlangıçta belirli bir boyutta cache oluştur
-        self.cached_seq_len = config.max_position_embeddings
-        self.cos_cached, self.sin_cached = self.build_rotary_embeddings(self.cached_seq_len, self.head_dim)
+        self.cached_seq_len = self.config.max_position_embeddings
+        cos, sin = self.build_rotary_embeddings(self.cached_seq_len, self.head_dim)
 
+        self.register_buffer("cos_cached", cos)
+        self.register_buffer("sin_cached", sin)
+        
     def build_rotary_embeddings(self, seq_len, dim):
         position = torch.arange(0, seq_len, device=self.device, dtype=self.dtype)
         inv_freq = 1.0 / (self.base ** (torch.arange(0, dim, 2, device=self.device, dtype=self.dtype) / dim))
@@ -365,7 +368,10 @@ class RotaryPositionalEmbedding(nn.Module):
             # Gerekli uzunluk cache'den büyükse, yeniden hesapla ve güncelle
             print(f"🔄 [RoPE] Yeni cache oluşturuluyor: {seq_len_needed} token")
             self.cached_seq_len = seq_len_needed
-            self.cos_cached, self.sin_cached = self.build_rotary_embeddings(seq_len_needed, self.head_dim)
+            cos, sin = self.build_rotary_embeddings(seq_len_needed, self.head_dim)
+
+            self.cos_cached.data = cos
+            self.sin_cached.data = sin
 
         # Seçili pozisyonlara göre cos/sin al
         cos = self.cos_cached.squeeze(0).squeeze(0)[position_ids].unsqueeze(2)  # [B, T, 1, D]
@@ -412,14 +418,14 @@ class CrispyLLMConfig(PretrainedConfig):
     
     model_type = "crispy"
     _attn_implementation: Optional[str] = "eager" 
-    def __init__(self, vocab_size=1000, max_seq_len=512*4,hidden_size=768, max_position_embeddings=4096, rope_scaling= {"type": "linear", "factor": 2.0}, num_hidden_layers=12, device="cuda", decoder_dropout=0.2,attention_dropout = 0.2,dtype="bfloat16", **kwargs):
+    def __init__(self, vocab_size=1000, max_seq_len=512*4, n_heads=16,hidden_size=768, max_position_embeddings=4096, rope_scaling= {"type": "linear", "factor": 2.0}, num_hidden_layers=12, device="cuda", decoder_dropout=0.2,attention_dropout = 0.2,dtype="bfloat16", **kwargs):
         super().__init__(**kwargs)
         
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
-        
+        self.n_heads = n_heads
         self.use_flash_attention_2=kwargs.get("use_flash_attention_2")
         
         self.layer_norm_bias=True
@@ -438,7 +444,8 @@ class CrispyLLMConfig(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
         self.rope_scaling = rope_scaling
 
-        
+        assert self.hidden_size % self.n_heads == 0, "❌ hidden_size, n_heads'e tam bölünmelidir!"
+
 
     
 class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
@@ -465,7 +472,7 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
         self.gradient_checkpointing = config.gradient_checkpointing
 
         self.embedding = EmbeddingLayer( token_count=config.vocab_size, max_seq_len = config.max_seq_len, hidden_size = config.hidden_size, device=config.device, dtype=config.dtype )
-        self.decoderBlocks = nn.ModuleList([(DecoderBlock(config=config,n_heads=config.n_heads,hidden_size= config.hidden_size, max_seq_len=config.max_seq_len,  device=config.device, dtype=config.dtype)) for i in range(config.num_hidden_layers)])
+        self.decoderBlocks = nn.ModuleList([(DecoderBlock(config=config, n_heads=config.n_heads,hidden_size= config.hidden_size, max_seq_len=config.max_seq_len,  device=config.device, dtype=config.dtype)) for i in range(config.num_hidden_layers)])
         
         self.final_ln = RMSNormBlock( normalized_shape=config.hidden_size, device=config.device, dtype=config.dtype)
 
@@ -512,6 +519,7 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
         from huggingface_hub import snapshot_download
 
         if os.path.isdir(pretrained_model_name_or_path)==False:
+            
             pretrained_model_name_or_path = snapshot_download(pretrained_model_name_or_path, local_dir=pretrained_model_name_or_path, cache_dir=pretrained_model_name_or_path)
 
         quantization_config = kwargs.pop("quantization_config", None)
@@ -541,12 +549,20 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
         model = cls(config, *model_args, **kwargs)
 
         # .safetensors varsa onu kullan, yoksa .bin
-        safetensor_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
+        safetensor_files = sorted(glob.glob(os.path.join(pretrained_model_name_or_path, "*.safetensors")))
         bin_path = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin")
+        
+        if len(safetensor_files) > 0:
+            print(f"📦 {len(safetensor_files)} adet safetensors dosyası bulundu. Yükleniyor...")
+            state_dict = {}
+            for file in safetensor_files:
+                print(f"   ↪️ {file}")
+                part = safe_load_file(file, device="cpu")
+                state_dict.update(part)  # parça parça birleşiyor
 
-        if os.path.exists(safetensor_path):
-            print("📦 Loading weights from model.safetensors")
-            state_dict = safe_load_file(safetensor_path, device="cpu")
+            #print("📦 Loading weights from model.safetensors")
+            #state_dict = safe_load_file(safetensor_path, device="cpu")
+
         elif os.path.exists(bin_path):
             print("📦 Loading weights from pytorch_model.bin")
             state_dict = torch.load(bin_path, map_location="cpu")
@@ -632,7 +648,7 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
         return self.lm_head
 
     def forward(self, input_ids, attention_mask=None, labels=None, past_key_values=None, use_cache=False, token_type_ids=None, **kwargs):
-
+        kwargs.pop("token_type_ids", None)
         x = self.embedding(input_ids)
 
         """  has_nan = torch.isnan(x).any()
@@ -681,8 +697,8 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
         
         loss= None
         if labels is not None:
-            
-            if torch.any(labels >= self.config.vocab_size):
+            #valid_labels = labels[labels >= 0]
+            if torch.any((labels >= 0) & (labels >= self.config.vocab_size)):
                 print("🚨 Hatalı label bulundu! Maksimum label:", labels.max().item())
                 print("🔢 Vocab size:", self.config.vocab_size)
                 raise ValueError("Label değeri vocab_size'dan büyük!")
@@ -695,7 +711,11 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
             shift_labels = labels[..., 1:].contiguous()
             
             #labels[labels == self.config.pad_token_id] = -100
+            shift_labels[shift_labels == self.config.pad_token_id] = -100
+
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
+            
+            assert not torch.isnan(loss), "Loss içinde NaN var"
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -704,6 +724,7 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
             hidden_states=None,
             attentions=None
         )
+    
     def resize_token_embeddings(self, new_num_tokens: int, pad_to_multiple_of: Optional[int] = None):
         old_embeddings = self.embedding.token_embedding.embedding_layer
         old_num_tokens, embedding_dim = old_embeddings.weight.size()
