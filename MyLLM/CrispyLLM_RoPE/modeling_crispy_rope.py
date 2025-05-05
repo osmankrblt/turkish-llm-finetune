@@ -418,7 +418,7 @@ class CrispyLLMConfig(PretrainedConfig):
     
     model_type = "crispy"
     _attn_implementation: Optional[str] = "eager" 
-    def __init__(self, vocab_size=1000, max_seq_len=512*4, n_heads=16,hidden_size=768, max_position_embeddings=4096, rope_scaling= {"type": "linear", "factor": 2.0}, num_hidden_layers=12, device="cuda", decoder_dropout=0.2,attention_dropout = 0.2,dtype="bfloat16", **kwargs):
+    def __init__(self, vocab_size=1000, max_seq_len=512*4, n_heads=16,hidden_size=768, max_position_embeddings=4096, rope_scaling= {"type": "linear", "factor": 2.0}, num_hidden_layers=12, device="cuda", decoder_dropout=0.2,attention_dropout = 0.2,dtype="bfloat16",pad_token_id=0, bos_token_id=4, eos_token_id=5, unk_token_id=1 ,  **kwargs):
         super().__init__(**kwargs)
         
         self.vocab_size = vocab_size
@@ -444,6 +444,11 @@ class CrispyLLMConfig(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
         self.rope_scaling = rope_scaling
 
+        self.pad_token_id=pad_token_id
+        self.bos_token_id=bos_token_id
+        self.eos_token_id=eos_token_id
+        self.unk_token_id=unk_token_id
+
         assert self.hidden_size % self.n_heads == 0, "❌ hidden_size, n_heads'e tam bölünmelidir!"
 
 
@@ -454,17 +459,12 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = CrispyLLMConfig
     supports_gradient_checkpointing = True
 
-    def __init__(self,  config: CrispyLLMConfig, 
-        pad_token_id=3,
-        bos_token_id=0,
-        eos_token_id=1,
-        unk_token_id=2, 
-        *args, **kwargs):
+    def __init__(self,  config: CrispyLLMConfig, *args, **kwargs):
         super().__init__(config, 
-                        pad_token_id=pad_token_id,
-                        bos_token_id=bos_token_id,
-                        eos_token_id=eos_token_id,
-                        unk_token_id=unk_token_id,
+                        pad_token_id=config.pad_token_id,
+                        bos_token_id=config.bos_token_id,
+                        eos_token_id=config.eos_token_id,
+                        unk_token_id=config.unk_token_id,
                         )
 
         self.validate_attention_config(config)
