@@ -697,13 +697,6 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
         
         loss= None
         if labels is not None:
-            #valid_labels = labels[labels >= 0]
-            if torch.any((labels >= 0) & (labels >= self.config.vocab_size)):
-                print("🚨 Hatalı label bulundu! Maksimum label:", labels.max().item())
-                print("🔢 Vocab size:", self.config.vocab_size)
-                raise ValueError("Label değeri vocab_size'dan büyük!")
-
-
             labels = labels.clone()
 
             # SHIFT: logits ve labels kaydırılıyor
@@ -712,6 +705,24 @@ class CrispyForCausalLM(PreTrainedModel, GenerationMixin):
             
             #labels[labels == self.config.pad_token_id] = -100
             shift_labels[shift_labels == self.config.pad_token_id] = -100
+
+            #valid_labels = labels[labels >= 0]
+            if torch.any((labels >= 0) & (labels >= self.config.vocab_size)):
+                print("🚨 Hatalı label bulundu! Maksimum label:", labels.max().item())
+                print("🔢 Vocab size:", self.config.vocab_size)
+                raise ValueError("Label değeri vocab_size'dan büyük!")
+            
+            if torch.any((shift_labels >= self.config.vocab_size)):
+                print("🚨 Hatalı label! Max label:", shift_labels.max().item())
+                raise ValueError("label değeri vocab_size'dan büyük")
+
+            if (shift_labels != -100).sum() == 0:
+                print("🚨 shift_labels tamamen -100! Loss hesaplanamaz.")
+
+
+            assert not torch.isnan(shift_logits).any(), "⚠️ shift_logits içinde NaN var"
+            assert not torch.isinf(shift_logits).any(), "⚠️ shift_logits içinde Inf var"
+
 
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
             
